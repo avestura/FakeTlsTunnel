@@ -1,46 +1,66 @@
-import dns_resolve, hashes, print, parseopt, strutils, random, net
+import dns_resolve, hashes, print, parseopt, strutils, random, net, strutils, osproc , strformat
 import std/sha1
 
 const version = "10.2"
-const socket_buffered* = false
-
-const log_data_len* = false
-const log_conn_create* = true
-const log_conn_destory* = true
-
-var trust_time*: uint = 3 #secs
-var pool_size*: uint = 16 #secs
-var max_idle_time*:uint = 1000 #secs (default TCP RFC is 3600)
-
-const chunk_size* = 4000
-
-const mux*: bool = false
 
 type RunMode*{.pure.} = enum
     tunnel, server
 
-
 var mode*: RunMode = RunMode.tunnel
+
+# [Log Options]
+const log_data_len* = false
+const log_conn_create* = true
+const log_conn_destory* = true
+
+
+# [Connection]
+var trust_time*: uint = 3 #secs
+var pool_size*: uint = 16 #secs
+var max_idle_time*:uint = 120 #secs (default TCP RFC is 3600)
+const mux*: bool = false
+const socket_buffered* = false
+const chunk_size* = 4000
+
+
+# [Routes]
 const listen_addr* = "0.0.0.0"
 var listen_port* = -1
 var next_route_addr* = ""
 var next_route_port* = -1
 var final_target_domain* = ""
 var final_target_ip*: string
-const final_target_port* = 443
-
-
+const final_target_port* = 443 # port of the sni host (443 for tls handshake)
 var self_ip*: string
 
 
-
+# [passwords and hashes]
 var password* = ""
 var password_hash*: string
 var sh1*: uint32
 var sh2*: uint32
 var sh3*: uint8
-
 var random_600* = newString(len = 600)
+
+var disable_ufw* = true
+var reset_iptable* = true
+var multi_port* = false
+var pmin:int
+var pmax:int
+const SO_ORIGINAL_DST* = 80
+const SOL_IP* = 0
+
+proc iptablesInstalled(): bool = 
+    execCmdEx("""dpkg-query -W --showformat='${Status}\n' $REQUIRED_PKG|grep "install ok install"""").output != ""
+
+
+proc resetIptables*()=
+        assert 0 == execCmdEx("iptables -t nat -F").exitCode
+        assert 0 == execCmdEx("iptables -t nat -X").exitCode
+proc createIptablesRules*()=
+    if reset_iptable:resetIptables()
+    assert 0 == execCmdEx(&"""iptables -t nat -A PREROUTING -p tcp --dport {pmin}:{pmax} -j REDIRECT --to-port {listen_port}""").exitCode
+
 
 proc init*() =
     print version
@@ -48,7 +68,7 @@ proc init*() =
     for i in 0..<random_600.len():
         random_600[i] = rand(char.low .. char.high).char
 
-    var p = initOptParser(longNoVal = @["server", "tunnel"])
+    var p = initOptParser(longNoVal = @["server", "tunnel","multiport", "keep-ufw", "keep-iptables"])
     while true:
         p.next()
         case p.kind
@@ -62,13 +82,36 @@ proc init*() =
                     of "tunnel":
                         mode = RunMode.tunnel
                         print mode
+                    of "keep-ufw":
+                        disable_ufw = false
+                    of "keep-iptables":
+                        reset_iptable = false
+                    of "multiport":
+                        multiport = true
+                        
                     else:
-                        echo "specify mode (--tunnel or --server)"
+                        echo "invalid option"
                         quit(-1)
             else:
                 case p.key:
                     of "lport":
-                        listen_port = parseInt(p.val)
+                        try:
+                            listen_port = parseInt(p.val)
+                        except : #multi port
+                            when defined(windows) or defined(android):
+                                echo "multi listen port unsupported for windows."
+                                quit(-1)
+                            else:
+                                if not iptablesInstalled():
+                                    echo "multi listen port requires iptables to be installed."
+                                    quit(-1)
+                                multi_port = true
+                                let port_range = p.val.split('-')
+                                assert port_range.len == 2 , "Invalid listen port range. !"
+                                listen_port = 0
+                                pmin = max(1,port_range[0].parseInt)
+                                pmax = min(65535,port_range[1].parseInt)
+
                         print listen_port
                     of "toip":
                         next_route_addr = (p.val)
