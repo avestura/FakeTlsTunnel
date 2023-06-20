@@ -1,21 +1,24 @@
-import std/[asyncdispatch, strformat, strutils, net, tables, random]
+import std/[asyncdispatch, nativesockets, strformat, strutils, net, tables, random, endians]
 import overrides/[asyncnet]
 import times, print, connection, pipe
 from globals import nil
 
-
+when defined(windows):
+    from winlean import getSockOpt
+else:
+    from posix import getSockOpt
 
 type
     TunnelConnectionPoolContext = object
         listener: Connection
         inbound: Connections
-        outbound: Connections
+        outbound: Table[uint32,Connections]
 
 var context = TunnelConnectionPoolContext()
 let ssl_ctx = newContext(verifyMode = CVerifyPeer)
 
 
-proc ssl_connect(con: Connection, ip: string, port: int, sni: string){.async.} =
+proc ssl_connect(con: Connection, ip: string, client_origin_port: uint32, sni: string){.async.} =
     wrapSocket(ssl_ctx, con.socket)
     con.isfakessl = true
     var fc = 0
@@ -23,7 +26,7 @@ proc ssl_connect(con: Connection, ip: string, port: int, sni: string){.async.} =
         if fc > 6:
             raise newException(ValueError, "Request Timed Out!")
         try:
-            await con.socket.connect(ip, port.Port, sni = sni)
+            await con.socket.connect(ip, con.port.Port, sni = sni)
             break
         except:
             echo &"ssl connect error ! retry in {min(1000,fc*50)} ms"
@@ -35,45 +38,52 @@ proc ssl_connect(con: Connection, ip: string, port: int, sni: string){.async.} =
     # let to_send = &"GET / HTTP/1.1\nHost: {sni}\nAccept: */*\n\n"
     # await socket.send(to_send)  [not required ...]
 
-    con.socket.isSsl = false #now break it
+    #now we use this socket as a normal tcp data transfer socket
+    con.socket.isSsl = false 
 
+    #AES default chunk size is 16 so use a multple of 16 
     let rlen = 16*(4+rand(4))
     var random_trust_data: string
     random_trust_data.setLen(rlen)
 
-    for i in 0..<rlen:
-        random_trust_data[i] = rand(char.low .. char.high).char
-
     prepareMutation(random_trust_data)
     copyMem(unsafeAddr random_trust_data[0], unsafeAddr globals.sh1.uint32, 4)
     copyMem(unsafeAddr random_trust_data[4], unsafeAddr globals.sh2.uint32, 4)
-    copyMem(unsafeAddr random_trust_data[8], unsafeAddr con.id, 4)
+    if globals.multi_port:
+        copyMem(unsafeAddr random_trust_data[8], unsafeAddr client_origin_port, 4)
+    # copyMem(unsafeAddr random_trust_data[12], unsafeAddr con.id, 4)
+    copyMem(unsafeAddr random_trust_data[12], unsafeAddr(globals.random_600[rand(250)]), rlen-12)
 
     await con.socket.send(random_trust_data)
     con.trusted = TrustStatus.yes
 
 
-proc poolFrame(count : uint = 0) =
+proc poolFrame(client_port:uint32 , count: uint = 0){.gcsafe.} =
     proc create() =
         var con = newConnection(address = globals.next_route_addr)
-        var fut = ssl_connect(con, globals.next_route_addr, globals.next_route_port, globals.final_target_domain)
+        con.port = globals.next_route_port.uint32
+        var fut = ssl_connect(con, globals.next_route_addr, client_port, globals.final_target_domain)
         fut.addCallback(
             proc() {.gcsafe.} =
             if fut.failed:
                 echo fut.error.msg
             else:
                 if globals.log_conn_create: echo &"[createNewCon] registered a new connection to the pool"
-                context.outbound.register con
+                context.outbound[client_port].register con
         )
-        
 
-    var i = context.outbound.connections.len()
-    while i.uint32 < (if count == 0 :globals.pool_size else: count):
-        try:
+
+    var i = context.outbound[client_port].connections.len().uint
+    if count == 0:
+        if i < globals.pool_size div 2:
             create()
-            inc i
-        except:
-            discard
+            create()
+        else:
+            create()
+
+    else:
+        for i in 0..count:
+            create()
 
 
 
@@ -114,24 +124,29 @@ proc processConnection(client: Connection) {.async.} =
         close()
 
     proc chooseRemote() {.async.} =
-        remote = context.outbound.grab()
+        if not context.outbound.hasKeyOrPut(client.port,Connections()):
+            poolFrame(client.port,globals.pool_size)
+            await sleepAsync(250)
+
+        remote = context.outbound[client.port].grab()
         if remote != nil:
             if globals.log_conn_create: echo &"[createNewCon][Succ] grabbed a connection"
-            poolFrame()
+            callSoon do: poolFrame(client.port)
+
             asyncCheck processRemote()
             return
 
-        await sleepAsync(600)
-        remote = context.outbound.grab()
+        await sleepAsync(300)
+        remote = context.outbound[client.port].grab()
 
         if remote != nil:
             if globals.log_conn_create: echo &"[createNewCon][Succ] grabbed a connection"
-            poolFrame()
+            callSoon do: poolFrame(client.port)
             asyncCheck processRemote()
         else:
-            
+
             if globals.log_conn_destory: echo &"[createNewCon][Error] left without connection, closes forcefully."
-            poolFrame(1)
+            callSoon do: poolFrame(client.port)
             client.close()
 
 
@@ -164,25 +179,51 @@ proc processConnection(client: Connection) {.async.} =
         print getCurrentExceptionMsg()
 
 
+
+
 proc start*(){.async.} =
+    var pbuf = newString(len = 16)
+
     proc start_server(){.async.} =
 
         context.listener = newConnection(address = "This Server")
         context.listener.socket.setSockOpt(OptReuseAddr, true)
         context.listener.socket.bindAddr(globals.listen_port.Port, globals.listen_addr)
+        if globals.multi_port:
+            globals.listen_port = getSockName(context.listener.socket.getFd().SocketHandle).uint32
+            echo "Multi port mode !"
+            globals.createIptablesRules()
+
         echo &"Started tcp server... {globals.listen_addr}:{globals.listen_port}"
         context.listener.socket.listen()
 
         while true:
             let (address, client) = await context.listener.socket.acceptAddr()
             var con = newConnection(client, address)
-            if globals.log_conn_create: print "Connected client: ", address
+            if globals.multi_port:
+                var origin_port:cushort
+                var size = 16.SockLen
+                if getSockOpt(con.socket.getFd().SocketHandle, cint(globals.SOL_IP), cint(globals.SO_ORIGINAL_DST),
+                addr(pbuf[0]), addr(size)) < 0'i32:
+                    echo "multiport failure getting origin port. !"
+                    continue
+                bigEndian16(addr origin_port,addr pbuf[2])
+
+                con.port = origin_port
+                if globals.log_conn_create: print "Connected client: ", address , " : ",  con.port
+            else:
+                con.port = globals.listen_port
+
+                if globals.log_conn_create: print "Connected client: ", address
 
             asyncCheck processConnection(con)
 
-    poolFrame()
+    if not globals.multi_port:
+        context.outbound[globals.listen_port] = Connections()
+        poolFrame(globals.listen_port,globals.pool_size)
+        
     await sleepAsync(1200)
-    echo &"Mode Tunnel:  {globals.self_ip}  <->  {globals.next_route_addr}  => {globals.final_target_domain}"
+    echo &"Mode Tunnel:  {globals.self_ip} <->  {globals.next_route_addr}  => {globals.final_target_domain}"
     asyncCheck start_server()
 
 
