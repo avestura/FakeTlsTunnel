@@ -93,7 +93,8 @@ proc newConnection*(socket: AsyncSocket = nil, address: string, buffered: bool =
     else: result.socket = socket
 
     when not defined(android):
-        result.socket.setSockOpt(OptNoDelay, true)
+        if not globals.is_docker:
+            result.socket.setSockOpt(OptNoDelay, true)
     allConnections.add result
 
 # proc attachID*(con : var Connection)=

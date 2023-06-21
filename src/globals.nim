@@ -1,5 +1,6 @@
 import dns_resolve, hashes, print, parseopt, strutils, random, net, strutils, osproc , strformat
 import std/sha1
+import os
 
 const version = "11"
 
@@ -50,6 +51,9 @@ var pmax:int
 const SO_ORIGINAL_DST* = 80
 const SOL_IP* = 0
 
+# [runtime]
+var is_docker* = false
+
 proc iptablesInstalled(): bool = 
     execCmdEx("""dpkg-query -W --showformat='${Status}\n' $REQUIRED_PKG|grep "install ok install"""").output != ""
 
@@ -66,6 +70,9 @@ proc createIptablesRules*()=
 
 proc init*() =
     print version
+
+    is_docker = os.getEnv("LAUNCH_MODE") == "docker"
+    print is_docker
 
     for i in 0..<random_600.len():
         random_600[i] = rand(char.low .. char.high).char
