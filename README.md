@@ -211,7 +211,7 @@ docker run -p 443:443 avestura/faketls:11.0 --server --lport:443 --toip:127.0.0.
 
 Iran Tunnel:
 ```
-docker run -p 443:443 --tunnel --lport:443 --toip:INPUT_SERVER_IP_HERE --toport:443 --sni:github.com --password:123ab
+docker run -p 443:443 avestura/faketls:11.0 --tunnel --lport:443 --toip:INPUT_SERVER_IP_HERE --toport:443 --sni:github.com --password:123ab
 ```
 
 # حمایت
