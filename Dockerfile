@@ -4,7 +4,6 @@ RUN apk add nim
 RUN apk add nimble
 RUN apk add git
 RUN apk add build-base
-RUN apk add iptables
 
 WORKDIR /faketls
 
@@ -17,6 +16,8 @@ COPY .gitignore .gitignore
 RUN nim build
 
 FROM alpine:3.18.2 as runner
+
+RUN apk add iptables
 
 WORKDIR /faketls 
 
