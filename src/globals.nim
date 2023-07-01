@@ -2,7 +2,7 @@ import dns_resolve, hashes, print, parseopt, strutils, random, net, strutils, os
 import std/sha1
 import os
 
-const version = "11.1"
+const version = "11.2"
 
 type RunMode*{.pure.} = enum
     tunnel, server
@@ -13,16 +13,17 @@ var mode*: RunMode = RunMode.tunnel
 const log_data_len* = false
 const log_conn_create* = true
 const log_conn_destory* = true
+const log_conn_error* = true
 
 
 # [Connection]
 var trust_time*: uint = 3 #secs
 var pool_size*: uint = 16 #secs
-var max_idle_time*:uint = 30 #secs (default TCP RFC is 3600)
+var max_idle_time*:uint = 240 #secs (default TCP RFC is 3600)
+var max_pool_unused_time*:uint = 15 #secs 
 const mux*: bool = false
 const socket_buffered* = false
-const chunk_size* = 4000
-
+const chunk_size* = 4000 
 
 # [Routes]
 const listen_addr* = "0.0.0.0"
@@ -43,11 +44,16 @@ var sh2*: uint32
 var sh3*: uint8
 var random_600* = newString(len = 600)
 
+# [settings]
 var disable_ufw* = true
 var reset_iptable* = true
+
+# [multiport]
 var multi_port* = false
 var pmin:int
 var pmax:int
+
+# [posix constants]
 const SO_ORIGINAL_DST* = 80
 const SOL_IP* = 0
 
